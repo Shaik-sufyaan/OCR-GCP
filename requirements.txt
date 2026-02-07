@@ -1,0 +1,19 @@
+# Core dependencies for OlmOCR model
+transformers>=4.47.0
+torch>=2.0.0
+pillow>=10.0.0
+accelerate>=0.20.0
+qwen-vl-utils
+
+# OlmOCR toolkit (required for prompts and utilities)
+git+https://github.com/allenai/olmocr.git
+
+# API and deployment
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+pydantic>=2.0.0
+
+# Cloud and utilities
+google-cloud-storage>=2.10.0
+aiofiles>=23.0.0
