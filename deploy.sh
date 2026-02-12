@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# OlmOCR Deployment Script for GCP Cloud Run
+# OlmOCR Deployment Script for GCP Cloud Run (with GPU)
 # This script automates the deployment process
 
 set -e
@@ -14,9 +14,11 @@ NC='\033[0m' # No Color
 # Default values
 REGION="us-central1"
 SERVICE_NAME="olmocr-api"
-MEMORY="8Gi"
-CPU="2"
-MAX_INSTANCES="10"
+MEMORY="16Gi"
+CPU="4"
+GPU="1"
+GPU_TYPE="nvidia-l4"
+MAX_INSTANCES="5"
 TIMEOUT="300"
 
 # Function to print colored messages
@@ -51,6 +53,8 @@ fi
 print_info "Using GCP Project: $PROJECT_ID"
 print_info "Region: $REGION"
 print_info "Service Name: $SERVICE_NAME"
+print_info "GPU: $GPU x $GPU_TYPE"
+print_info "Memory: $MEMORY | CPU: $CPU"
 
 # Confirm deployment
 read -p "Do you want to proceed with deployment? (y/n) " -n 1 -r
@@ -67,8 +71,8 @@ gcloud services enable run.googleapis.com
 gcloud services enable containerregistry.googleapis.com
 
 # Build the container
-print_info "Building container image..."
-gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE_NAME
+print_info "Building container image (this may take 10-15 minutes)..."
+gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE_NAME --timeout=1800s
 
 if [ $? -ne 0 ]; then
     print_error "Container build failed!"
@@ -77,16 +81,19 @@ fi
 
 print_info "Container built successfully!"
 
-# Deploy to Cloud Run
-print_info "Deploying to Cloud Run..."
+# Deploy to Cloud Run with GPU
+print_info "Deploying to Cloud Run with GPU..."
 gcloud run deploy $SERVICE_NAME \
   --image gcr.io/$PROJECT_ID/$SERVICE_NAME \
   --platform managed \
   --region $REGION \
   --memory $MEMORY \
   --cpu $CPU \
+  --gpu $GPU \
+  --gpu-type $GPU_TYPE \
   --timeout $TIMEOUT \
   --max-instances $MAX_INSTANCES \
+  --no-cpu-throttling \
   --allow-unauthenticated
 
 if [ $? -ne 0 ]; then
@@ -108,6 +115,9 @@ echo ""
 print_info "Test your API with:"
 echo "curl $SERVICE_URL/health"
 echo ""
-print_info "Or use the test script:"
-echo "python test_api.py $SERVICE_URL path/to/image.jpg"
+print_info "OCR an image:"
+echo "curl -X POST $SERVICE_URL/ocr -F 'file=@image.jpg'"
+echo ""
+print_info "OCR a PDF (specific pages):"
+echo "curl -X POST '$SERVICE_URL/ocr/pdf?pages=1-3' -F 'file=@document.pdf'"
 echo ""

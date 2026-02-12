@@ -4,9 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
-venv/
-ENV/
 build/
 develop-eggs/
 dist/
@@ -30,7 +27,8 @@ MANIFEST
 venv/
 ENV/
 env/
-.venv
+.venv/
+olmocr-env/
 
 # PyCharm
 .idea/
@@ -60,10 +58,10 @@ logs/
 .coverage
 htmlcov/
 
-# GCP
+# GCP credentials
 gcp-key.json
-*.json
-!cloudbuild.yaml
+*-credentials.json
+*-key.json
 
 # Temporary files
 *.tmp

@@ -1,5 +1,5 @@
 # Cloud Build configuration for automated deployment
-# This file enables CI/CD with Google Cloud Build
+# Builds and deploys olmOCR API to Cloud Run with GPU
 
 steps:
   # Step 1: Build the Docker image
@@ -11,7 +11,7 @@ steps:
       - '-t'
       - 'gcr.io/$PROJECT_ID/olmocr-api:latest'
       - '.'
-    timeout: 1200s
+    timeout: 1800s
 
   # Step 2: Push the image to Container Registry
   - name: 'gcr.io/cloud-builders/docker'
@@ -24,7 +24,7 @@ steps:
       - 'push'
       - 'gcr.io/$PROJECT_ID/olmocr-api:latest'
 
-  # Step 3: Deploy to Cloud Run
+  # Step 3: Deploy to Cloud Run with GPU
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
     entrypoint: gcloud
     args:
@@ -38,13 +38,18 @@ steps:
       - '--platform'
       - 'managed'
       - '--memory'
-      - '8Gi'
+      - '16Gi'
       - '--cpu'
-      - '2'
+      - '4'
+      - '--gpu'
+      - '1'
+      - '--gpu-type'
+      - 'nvidia-l4'
       - '--timeout'
       - '300'
       - '--max-instances'
-      - '10'
+      - '5'
+      - '--no-cpu-throttling'
       - '--allow-unauthenticated'
 
 # Store images in Container Registry
@@ -55,7 +60,7 @@ images:
 # Build options
 options:
   machineType: 'N1_HIGHCPU_8'
-  timeout: 1800s
+  timeout: 2400s
   logging: CLOUD_LOGGING_ONLY
 
 # Substitutions (can be overridden)
