@@ -1,6 +1,7 @@
 # Model inference (the app uses HuggingFace transformers directly, NOT vllm)
 transformers>=4.47.0
 accelerate>=0.26.0
+compressed-tensors
 qwen-vl-utils
 pillow>=10.0.0
 

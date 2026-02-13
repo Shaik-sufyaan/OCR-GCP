@@ -16,6 +16,7 @@ import traceback
 import base64
 import tempfile
 import os
+import threading
 
 # Configure logging
 logging.basicConfig(
@@ -44,6 +45,8 @@ app.add_middleware(
 model = None
 processor = None
 device = None
+model_loading = False
+model_error = None
 
 # Supported file types
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
@@ -55,7 +58,7 @@ def get_ocr_prompt():
     Uses the olmocr package if available, otherwise uses the exact prompt text
     from olmocr/prompts/prompts.py so no dependency on olmocr is needed."""
     try:
-        from olmocr.prompts import build_no_anchoring_v4_yaml_prompt
+        from olmocr.prompts import build_no_anchoring_v4_yaml_prompt  # type: ignore[import-not-found]
         return build_no_anchoring_v4_yaml_prompt()
     except ImportError:
         # Exact prompt from olmocr v0.4.25 - olmocr/prompts/prompts.py
@@ -73,7 +76,7 @@ def get_ocr_prompt():
 def render_pdf_page_to_base64(pdf_bytes, page_num=1, target_longest_dim=1288):
     """Render a PDF page to base64 PNG. Uses olmocr if available, otherwise falls back to pdf2image."""
     try:
-        from olmocr.data.renderpdf import render_pdf_to_base64png
+        from olmocr.data.renderpdf import render_pdf_to_base64png  # type: ignore[import-not-found]
         # Write PDF bytes to a temp file since render_pdf_to_base64png expects a file path
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
             tmp.write(pdf_bytes)
@@ -179,12 +182,12 @@ def run_inference(image_base64: str) -> str:
     return decoded[0]
 
 
-@app.on_event("startup")
-async def load_model():
-    """Load the OlmOCR model on startup"""
-    global model, processor, device
+def _load_model_sync():
+    """Load the OlmOCR model (runs in a background thread)."""
+    global model, processor, device, model_loading, model_error
 
     try:
+        model_loading = True
         logger.info("Loading OlmOCR model...")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -212,12 +215,21 @@ async def load_model():
             model.to(device)
 
         model.eval()
+        model_loading = False
         logger.info("Model loaded successfully!")
 
     except Exception as e:
+        model_loading = False
+        model_error = str(e)
         logger.error(f"Error loading model: {str(e)}")
         logger.error(traceback.format_exc())
-        raise
+
+
+@app.on_event("startup")
+async def load_model():
+    """Start model loading in background thread so the server can respond immediately."""
+    thread = threading.Thread(target=_load_model_sync, daemon=True)
+    thread.start()
 
 
 @app.get("/")
@@ -227,12 +239,17 @@ async def root():
         "status": "running",
         "model": "allenai/olmOCR-2-7B-1025-FP8",
         "device": str(device),
+        "model_loaded": model is not None,
     }
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
+    if model_loading:
+        return {"status": "loading", "model_loaded": False, "detail": "Model is still loading..."}
+    if model_error:
+        return JSONResponse(status_code=503, content={"detail": f"Model failed to load: {model_error}"})
     if model is None or processor is None:
         return JSONResponse(status_code=503, content={"detail": "Model not loaded"})
     return {
