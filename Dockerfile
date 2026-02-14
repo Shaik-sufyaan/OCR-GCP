@@ -1,5 +1,5 @@
 # Use NVIDIA CUDA base image for GPU support
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 # Prevent interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -40,6 +40,12 @@ RUN pip install --no-cache-dir torch torchvision \
 # Copy and install remaining requirements (torch is already installed above)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-download model and processor during build (avoids ~5GB download on every cold start)
+RUN python3.11 -c "\
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration; \
+AutoProcessor.from_pretrained('Qwen/Qwen2.5-VL-7B-Instruct'); \
+Qwen2_5_VLForConditionalGeneration.from_pretrained('allenai/olmOCR-2-7B-1025-FP8')"
 
 # Copy application code
 COPY app.py .

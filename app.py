@@ -167,13 +167,11 @@ def run_inference(image_base64: str) -> str:
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output = model.generate(
             **inputs,
-            temperature=0.8,
             max_new_tokens=4096,
-            num_return_sequences=1,
-            do_sample=True,
+            do_sample=False,
         )
 
     prompt_length = inputs["input_ids"].shape[1]
@@ -204,6 +202,7 @@ def _load_model_sync():
                 model_name,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
+                attn_implementation="flash_attention_2",
             )
         else:
             logger.warning("No GPU detected! Running on CPU will be very slow.")

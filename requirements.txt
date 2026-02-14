@@ -2,6 +2,7 @@
 transformers>=4.47.0
 accelerate>=0.26.0
 compressed-tensors
+flash-attn
 qwen-vl-utils
 pillow>=10.0.0
 
