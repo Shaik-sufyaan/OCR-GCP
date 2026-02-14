@@ -59,8 +59,10 @@ images:
   - 'us-central1-docker.pkg.dev/$PROJECT_ID/olmocr-repo/olmocr-api:$COMMIT_SHA'
   - 'us-central1-docker.pkg.dev/$PROJECT_ID/olmocr-repo/olmocr-api:latest'
 
+# Build timeout (top-level)
+timeout: 2400s
+
 # Build options
 options:
   machineType: 'N1_HIGHCPU_8'
-  timeout: 2400s
   logging: CLOUD_LOGGING_ONLY
