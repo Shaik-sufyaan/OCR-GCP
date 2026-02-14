@@ -1,4 +1,4 @@
-# Use NVIDIA CUDA base image for GPU support
+# Use NVIDIA CUDA devel image (needed for vLLM CUDA kernels)
 FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 # Prevent interactive prompts during apt install
@@ -33,36 +33,41 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 # Upgrade pip
 RUN python3.11 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 
-# Install PyTorch with CUDA 12.8 support FIRST (before requirements.txt)
+# Install PyTorch with CUDA 12.8 support FIRST
 RUN pip install --no-cache-dir torch torchvision \
     --index-url https://download.pytorch.org/whl/cu128
 
-# Copy and install remaining requirements (torch is already installed above)
+# Install vLLM (pulls in its own dependencies)
+RUN pip install --no-cache-dir vllm
+
+# Install olmocr and remaining requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download model and processor during build (avoids ~5GB download on every cold start)
+# Pre-download models during build (avoids ~5GB download on every cold start)
 RUN python3.11 -c "\
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration; \
-AutoProcessor.from_pretrained('Qwen/Qwen2.5-VL-7B-Instruct'); \
-Qwen2_5_VLForConditionalGeneration.from_pretrained('allenai/olmOCR-2-7B-1025-FP8')"
+from huggingface_hub import snapshot_download; \
+snapshot_download('allenai/olmOCR-2-7B-1025-FP8'); \
+snapshot_download('Qwen/Qwen2.5-VL-7B-Instruct')"
 
-# Copy application code
+# Copy application code and entrypoint
 COPY app.py .
+COPY start.sh .
+RUN chmod +x start.sh
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
-# Ensure torch can find CUDA
+# Ensure torch/vLLM can find CUDA
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 # Expose port
 EXPOSE 8080
 
-# Health check (longer start period for model download on first run)
+# Health check (longer start period for vLLM model loading)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
-# Run the application
-CMD exec uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+# Run the entrypoint script (starts vLLM then FastAPI)
+CMD ["./start.sh"]

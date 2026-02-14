@@ -1,11 +1,12 @@
 """
-Unit tests for app.py with mocked model/processor.
+Unit tests for app.py with mocked vLLM backend.
 Run: python -m pytest test_app_unit.py -v
 """
 
 import base64
 import io
-from unittest.mock import patch, MagicMock
+import json
+from unittest.mock import patch, AsyncMock, MagicMock
 
 import pytest
 from PIL import Image
@@ -36,25 +37,27 @@ MOCK_RAW_OUTPUT = (
     "Hello, world!"
 )
 
+MOCK_VLLM_RESPONSE = {
+    "id": "chatcmpl-test",
+    "object": "chat.completion",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": MOCK_RAW_OUTPUT,
+            },
+            "finish_reason": "stop",
+        }
+    ],
+}
+
 
 @pytest.fixture()
 def client():
-    """TestClient with model/processor/device pre-mocked so startup is skipped."""
-    app_module.model = MagicMock()
-    app_module.processor = MagicMock()
-    app_module.device = "cpu"
-
-    # Temporarily remove the startup handler so load_model doesn't run
-    original_startup = app.router.on_startup.copy()
-    app.router.on_startup.clear()
-    try:
-        with TestClient(app, raise_server_exceptions=False) as c:
-            yield c
-    finally:
-        app.router.on_startup = original_startup
-        app_module.model = None
-        app_module.processor = None
-        app_module.device = None
+    """TestClient with vLLM health check mocked as ready."""
+    with TestClient(app, raise_server_exceptions=False) as c:
+        yield c
 
 
 # ---------------------------------------------------------------------------
@@ -134,47 +137,38 @@ class TestImageToBase64:
 
 
 # ---------------------------------------------------------------------------
-# 2. API endpoint tests (mocked model)
+# 2. API endpoint tests (mocked vLLM)
 # ---------------------------------------------------------------------------
 
 class TestRootEndpoint:
-    def test_root_returns_status(self, client):
+    @patch.object(app_module, "check_vllm_ready", new_callable=AsyncMock, return_value=True)
+    def test_root_returns_status(self, mock_ready, client):
         resp = client.get("/")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "running"
+        assert data["backend"] == "vllm"
         assert "olmOCR" in data["model"]
 
 
 class TestHealthEndpoint:
-    def test_healthy_when_model_loaded(self, client):
+    @patch.object(app_module, "check_vllm_ready", new_callable=AsyncMock, return_value=True)
+    def test_healthy_when_vllm_ready(self, mock_ready, client):
         resp = client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "healthy"
         assert data["model_loaded"] is True
 
-    def test_unhealthy_when_model_not_loaded(self):
-        """When model is None, /health should return 503."""
-        saved_model = app_module.model
-        saved_processor = app_module.processor
-        app_module.model = None
-        app_module.processor = None
-        original_startup = app.router.on_startup.copy()
-        app.router.on_startup.clear()
-        try:
-            with TestClient(app, raise_server_exceptions=False) as c:
-                resp = c.get("/health")
-            assert resp.status_code == 503
-            assert "not loaded" in resp.json()["detail"]
-        finally:
-            app.router.on_startup = original_startup
-            app_module.model = saved_model
-            app_module.processor = saved_processor
+    @patch.object(app_module, "check_vllm_ready", new_callable=AsyncMock, return_value=False)
+    def test_unhealthy_when_vllm_not_ready(self, mock_ready, client):
+        resp = client.get("/health")
+        assert resp.status_code == 503
+        assert "not ready" in resp.json()["detail"]
 
 
 class TestOcrEndpoint:
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     def test_image_upload(self, mock_inf, client):
         png_bytes = _make_png_bytes()
         resp = client.post("/ocr", files={"file": ("test.png", png_bytes, "image/png")})
@@ -185,7 +179,7 @@ class TestOcrEndpoint:
         assert data["metadata"]["primary_language"] == "en"
         mock_inf.assert_called_once()
 
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     def test_jpeg_upload(self, mock_inf, client):
         img = Image.new("RGB", (10, 10), color="red")
         buf = io.BytesIO()
@@ -202,7 +196,7 @@ class TestOcrEndpoint:
         assert data["success"] is False
         assert ".csv" in data["message"]
 
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
     def test_pdf_via_ocr_endpoint(self, mock_render, mock_inf, client):
         resp = client.post("/ocr", files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")})
@@ -211,7 +205,7 @@ class TestOcrEndpoint:
         assert data["success"] is True
         mock_render.assert_called_once()
 
-    @patch.object(app_module, "run_inference", side_effect=RuntimeError("boom"))
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, side_effect=RuntimeError("boom"))
     def test_inference_error_returns_500(self, mock_inf, client):
         png_bytes = _make_png_bytes()
         resp = client.post("/ocr", files={"file": ("test.png", png_bytes, "image/png")})
@@ -220,7 +214,7 @@ class TestOcrEndpoint:
 
 
 class TestOcrPdfEndpoint:
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
     def test_single_page(self, mock_render, mock_inf, client):
         resp = client.post(
@@ -233,7 +227,7 @@ class TestOcrPdfEndpoint:
         assert data["results"][0]["success"] is True
         assert data["results"][0]["text"] == "Hello, world!"
 
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
     def test_multiple_pages(self, mock_render, mock_inf, client):
         resp = client.post(
@@ -245,7 +239,7 @@ class TestOcrPdfEndpoint:
         assert len(data["results"]) == 3
         assert all(r["success"] for r in data["results"])
 
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
     def test_page_range(self, mock_render, mock_inf, client):
         resp = client.post(
@@ -257,7 +251,7 @@ class TestOcrPdfEndpoint:
         pages = [r["page"] for r in data["results"]]
         assert pages == [2, 3, 4]
 
-    @patch.object(app_module, "run_inference", side_effect=RuntimeError("page error"))
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, side_effect=RuntimeError("page error"))
     @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
     def test_page_level_error(self, mock_render, mock_inf, client):
         resp = client.post(
@@ -270,7 +264,7 @@ class TestOcrPdfEndpoint:
 
 
 class TestBatchEndpoint:
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     def test_multiple_images(self, mock_inf, client):
         files = [
             ("files", ("a.png", _make_png_bytes(color="red"), "image/png")),
@@ -284,7 +278,7 @@ class TestBatchEndpoint:
         assert data["results"][0]["filename"] == "a.png"
         assert data["results"][1]["filename"] == "b.png"
 
-    @patch.object(app_module, "run_inference", return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
     @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
     def test_mixed_image_and_pdf(self, mock_render, mock_inf, client):
         files = [
@@ -296,7 +290,7 @@ class TestBatchEndpoint:
         assert len(data["results"]) == 2
         assert all(r["success"] for r in data["results"])
 
-    @patch.object(app_module, "run_inference", side_effect=[MOCK_RAW_OUTPUT, RuntimeError("fail")])
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, side_effect=[MOCK_RAW_OUTPUT, RuntimeError("fail")])
     def test_partial_failure(self, mock_inf, client):
         files = [
             ("files", ("ok.png", _make_png_bytes(), "image/png")),

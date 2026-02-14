@@ -11,7 +11,7 @@ steps:
       - '-t'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/olmocr-repo/olmocr-api:latest'
       - '.'
-    timeout: 1800s
+    timeout: 2400s
 
   # Step 2: Push the image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
@@ -39,9 +39,9 @@ steps:
       - '--platform'
       - 'managed'
       - '--memory'
-      - '16Gi'
+      - '32Gi'
       - '--cpu'
-      - '4'
+      - '8'
       - '--gpu'
       - '1'
       - '--gpu-type'
@@ -60,7 +60,7 @@ images:
   - 'us-central1-docker.pkg.dev/$PROJECT_ID/olmocr-repo/olmocr-api:latest'
 
 # Build timeout (top-level)
-timeout: 2400s
+timeout: 3600s
 
 # Build options
 options:

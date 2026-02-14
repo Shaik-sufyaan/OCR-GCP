@@ -14,8 +14,8 @@ NC='\033[0m' # No Color
 # Default values
 REGION="us-central1"
 SERVICE_NAME="olmocr-api"
-MEMORY="16Gi"
-CPU="4"
+MEMORY="32Gi"
+CPU="8"
 GPU="1"
 GPU_TYPE="nvidia-l4"
 MAX_INSTANCES="5"

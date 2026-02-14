@@ -1,22 +1,21 @@
 """
 OlmOCR API Server
 Provides OCR capabilities using the allenai/olmOCR-2-7B-1025-FP8 model
+via a persistent vLLM server for fast inference.
 """
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from PIL import Image
+import httpx
 import io
 import re
-import torch
 import logging
 import traceback
 import base64
 import tempfile
 import os
-import threading
 
 # Configure logging
 logging.basicConfig(
@@ -25,11 +24,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# vLLM server config
+VLLM_BASE_URL = "http://localhost:8001/v1"
+
 # Initialize FastAPI app
 app = FastAPI(
     title="OlmOCR API",
-    description="OCR API powered by allenai/olmOCR-2-7B-1025-FP8",
-    version="2.0.0"
+    description="OCR API powered by allenai/olmOCR-2-7B-1025-FP8 via vLLM",
+    version="3.0.0"
 )
 
 # Add CORS middleware
@@ -40,13 +42,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global variables for model and processor
-model = None
-processor = None
-device = None
-model_loading = False
-model_error = None
 
 # Supported file types
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
@@ -142,119 +137,72 @@ def parse_model_output(raw_text: str) -> dict:
     return {"text": body, "metadata": metadata}
 
 
-def run_inference(image_base64: str) -> str:
-    """Run the model on a base64-encoded image and return raw text output."""
+async def check_vllm_ready() -> bool:
+    """Check if the vLLM server is ready by querying /v1/models."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{VLLM_BASE_URL}/models", timeout=5.0)
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def run_inference(image_base64: str) -> str:
+    """Send a chat completion request to the vLLM server and return raw text output."""
     prompt = get_ocr_prompt()
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-            ],
-        }
-    ]
+    payload = {
+        "model": "olmocr",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                ],
+            }
+        ],
+        "max_tokens": 4096,
+        "temperature": 0.8,
+    }
 
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    main_image = Image.open(io.BytesIO(base64.b64decode(image_base64)))
-
-    inputs = processor(
-        text=[text],
-        images=[main_image],
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-
-    with torch.inference_mode():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=4096,
-            do_sample=False,
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{VLLM_BASE_URL}/chat/completions",
+            json=payload,
+            timeout=120.0,
         )
+        resp.raise_for_status()
 
-    prompt_length = inputs["input_ids"].shape[1]
-    new_tokens = output[:, prompt_length:]
-    decoded = processor.tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-    return decoded[0]
-
-
-def _load_model_sync():
-    """Load the OlmOCR model (runs in a background thread)."""
-    global model, processor, device, model_loading, model_error
-
-    try:
-        model_loading = True
-        logger.info("Loading OlmOCR model...")
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {device}")
-
-        model_name = "allenai/olmOCR-2-7B-1025-FP8"
-
-        logger.info("Loading processor from Qwen/Qwen2.5-VL-7B-Instruct...")
-        processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
-
-        logger.info(f"Loading model from {model_name}...")
-        if device.type == "cuda":
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                attn_implementation="flash_attention_2",
-            )
-        else:
-            logger.warning("No GPU detected! Running on CPU will be very slow.")
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=True,
-            )
-            model.to(device)
-
-        model.eval()
-        model_loading = False
-        logger.info("Model loaded successfully!")
-
-    except Exception as e:
-        model_loading = False
-        model_error = str(e)
-        logger.error(f"Error loading model: {str(e)}")
-        logger.error(traceback.format_exc())
-
-
-@app.on_event("startup")
-async def load_model():
-    """Start model loading in background thread so the server can respond immediately."""
-    thread = threading.Thread(target=_load_model_sync, daemon=True)
-    thread.start()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 
 @app.get("/")
 async def root():
-    """Root endpoint - health check"""
+    """Root endpoint - service info"""
+    ready = await check_vllm_ready()
     return {
         "status": "running",
         "model": "allenai/olmOCR-2-7B-1025-FP8",
-        "device": str(device),
-        "model_loaded": model is not None,
+        "backend": "vllm",
+        "model_loaded": ready,
     }
 
 
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
-    if model_loading:
-        return {"status": "loading", "model_loaded": False, "detail": "Model is still loading..."}
-    if model_error:
-        return JSONResponse(status_code=503, content={"detail": f"Model failed to load: {model_error}"})
-    if model is None or processor is None:
-        return JSONResponse(status_code=503, content={"detail": "Model not loaded"})
+    ready = await check_vllm_ready()
+    if not ready:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "vLLM server not ready"},
+        )
     return {
         "status": "healthy",
         "model_loaded": True,
-        "device": str(device),
+        "backend": "vllm",
     }
 
 
@@ -291,7 +239,7 @@ async def perform_ocr(file: UploadFile = File(...)):
             )
 
         logger.info("Running inference...")
-        raw_output = run_inference(image_base64)
+        raw_output = await run_inference(image_base64)
         parsed = parse_model_output(raw_output)
 
         logger.info(f"OCR complete, extracted {len(parsed['text'])} chars")
@@ -342,7 +290,7 @@ async def ocr_pdf(file: UploadFile = File(...), pages: str = "1"):
             try:
                 logger.info(f"Processing page {page_num}...")
                 image_base64 = render_pdf_page_to_base64(contents, page_num=page_num)
-                raw_output = run_inference(image_base64)
+                raw_output = await run_inference(image_base64)
                 parsed = parse_model_output(raw_output)
                 results.append({
                     "page": page_num,
@@ -390,7 +338,7 @@ async def batch_ocr(files: list[UploadFile] = File(...)):
                 image = Image.open(io.BytesIO(contents))
                 image_base64 = image_to_base64(image)
 
-            raw_output = run_inference(image_base64)
+            raw_output = await run_inference(image_base64)
             parsed = parse_model_output(raw_output)
 
             results.append({
