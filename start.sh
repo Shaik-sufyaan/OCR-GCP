@@ -1,4 +1,4 @@
-#!/bin/bash
+#\!/bin/bash
 set -e
 
 echo "Starting vLLM server..."
@@ -9,14 +9,14 @@ vllm serve allenai/olmOCR-2-7B-1025-FP8 \
     --gpu-memory-utilization 0.90 \
     --dtype auto &
 
-VLLM_PID=$!
+VLLM_PID=$\!
 
 echo "Waiting for vLLM server to be ready..."
 TIMEOUT=300
 ELAPSED=0
 while [ $ELAPSED -lt $TIMEOUT ]; do
     if curl -s http://localhost:8001/v1/models > /dev/null 2>&1; then
-        echo "vLLM server is ready! (took ${ELAPSED}s)"
+        echo "vLLM server is ready\! (took ${ELAPSED}s)"
         break
     fi
     sleep 2

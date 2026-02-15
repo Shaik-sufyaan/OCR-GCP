@@ -53,7 +53,7 @@ snapshot_download('Qwen/Qwen2.5-VL-7B-Instruct')"
 # Copy application code and entrypoint
 COPY app.py .
 COPY start.sh .
-RUN chmod +x start.sh
+RUN sed -i 's/\r$//' start.sh && chmod +x start.sh
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
