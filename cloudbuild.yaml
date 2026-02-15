@@ -53,6 +53,8 @@ steps:
       - '--no-cpu-throttling'
       - '--allow-unauthenticated'
       - '--no-gpu-zonal-redundancy'
+      - '--concurrency'
+      - '4'
 
 # Store images in Artifact Registry
 images:
