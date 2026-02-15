@@ -4,10 +4,12 @@ Provides OCR capabilities using the allenai/olmOCR-2-7B-1025-FP8 model
 via a persistent vLLM server for fast inference.
 """
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import httpx
 import io
 import re
@@ -46,6 +48,23 @@ app.add_middleware(
 # Supported file types
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp"}
 PDF_EXTENSIONS = {".pdf"}
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+MAX_CONCURRENT_PAGES = 4  # Match vLLM --max-num-seqs
+
+# Thread pool for CPU-bound PDF rendering
+_render_pool = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PAGES)
+
+
+@app.middleware("http")
+async def check_vllm_middleware(request: Request, call_next):
+    """Return 503 on OCR endpoints if vLLM is down."""
+    if request.url.path not in ["/health", "/", "/docs", "/openapi.json"]:
+        if not await check_vllm_ready():
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "vLLM server unavailable"},
+            )
+    return await call_next(request)
 
 
 def get_ocr_prompt():
@@ -178,6 +197,60 @@ async def run_inference(image_base64: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
+async def render_all_pages(pdf_bytes: bytes, page_nums: list[int]) -> dict[int, str]:
+    """Render multiple PDF pages to base64 in parallel using threads (CPU-bound)."""
+    loop = asyncio.get_event_loop()
+    tasks = {
+        page_num: loop.run_in_executor(
+            _render_pool, render_pdf_page_to_base64, pdf_bytes, page_num
+        )
+        for page_num in page_nums
+    }
+    results = {}
+    for page_num, task in tasks.items():
+        results[page_num] = await task
+    return results
+
+
+async def process_pages_parallel(pdf_bytes: bytes, page_nums: list[int]) -> list[dict]:
+    """Process multiple PDF pages with parallel rendering and concurrent inference."""
+    sem = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
+
+    async def _process_one(page_num: int, image_base64: str) -> dict:
+        async with sem:
+            try:
+                raw_output = await run_inference(image_base64)
+                parsed = parse_model_output(raw_output)
+                return {
+                    "page": page_num,
+                    "text": parsed["text"],
+                    "metadata": parsed["metadata"],
+                    "success": True,
+                }
+            except Exception as e:
+                logger.error(f"Error on page {page_num}: {e}")
+                return {
+                    "page": page_num,
+                    "text": "",
+                    "success": False,
+                    "error": str(e),
+                }
+
+    # Phase 1: Render all pages in parallel (CPU-bound, threaded)
+    logger.info(f"Rendering {len(page_nums)} pages in parallel...")
+    rendered = await render_all_pages(pdf_bytes, page_nums)
+
+    # Phase 2: Run inference concurrently (GPU, semaphore-limited)
+    logger.info(f"Running inference on {len(page_nums)} pages (max {MAX_CONCURRENT_PAGES} concurrent)...")
+    inference_tasks = [
+        _process_one(page_num, rendered[page_num]) for page_num in page_nums
+    ]
+    results = await asyncio.gather(*inference_tasks)
+
+    # Sort by page number to preserve order
+    return sorted(results, key=lambda r: r["page"])
+
+
 @app.get("/")
 async def root():
     """Root endpoint - service info"""
@@ -220,6 +293,12 @@ async def perform_ocr(file: UploadFile = File(...)):
         logger.info(f"Received file: {file.filename}")
         contents = await file.read()
         logger.info(f"Read {len(contents)} bytes")
+
+        if len(contents) > MAX_FILE_SIZE:
+            return JSONResponse(
+                status_code=400,
+                content={"text": "", "success": False, "message": "File too large (max 50MB)"},
+            )
 
         ext = os.path.splitext(file.filename or "")[1].lower()
 
@@ -285,27 +364,7 @@ async def ocr_pdf(file: UploadFile = File(...), pages: str = "1"):
             else:
                 page_nums.append(int(part))
 
-        results = []
-        for page_num in page_nums:
-            try:
-                logger.info(f"Processing page {page_num}...")
-                image_base64 = render_pdf_page_to_base64(contents, page_num=page_num)
-                raw_output = await run_inference(image_base64)
-                parsed = parse_model_output(raw_output)
-                results.append({
-                    "page": page_num,
-                    "text": parsed["text"],
-                    "metadata": parsed["metadata"],
-                    "success": True,
-                })
-            except Exception as page_err:
-                logger.error(f"Error on page {page_num}: {page_err}")
-                results.append({
-                    "page": page_num,
-                    "text": "",
-                    "success": False,
-                    "error": str(page_err),
-                })
+        results = await process_pages_parallel(contents, page_nums)
 
         return {"results": results, "total_pages": len(page_nums)}
 
@@ -325,41 +384,52 @@ async def batch_ocr(files: list[UploadFile] = File(...)):
 
     Returns list of OCR results.
     """
-    results = []
+    sem = asyncio.Semaphore(MAX_CONCURRENT_PAGES)
 
+    async def _process_file(f_contents: bytes, filename: str, ext: str, content_type: str | None):
+        async with sem:
+            try:
+                if ext in PDF_EXTENSIONS or (content_type and "pdf" in content_type):
+                    loop = asyncio.get_event_loop()
+                    image_base64 = await loop.run_in_executor(
+                        _render_pool, render_pdf_page_to_base64, f_contents, 1
+                    )
+                else:
+                    image = Image.open(io.BytesIO(f_contents))
+                    image_base64 = image_to_base64(image)
+
+                raw_output = await run_inference(image_base64)
+                parsed = parse_model_output(raw_output)
+
+                return {
+                    "filename": filename,
+                    "text": parsed["text"],
+                    "metadata": parsed["metadata"],
+                    "success": True,
+                }
+            except Exception as e:
+                logger.error(f"Error processing {filename}: {str(e)}")
+                return {
+                    "filename": filename,
+                    "text": "",
+                    "success": False,
+                    "error": str(e),
+                }
+
+    # Read all files first, then process concurrently
+    file_data = []
     for file in files:
-        try:
-            contents = await file.read()
-            ext = os.path.splitext(file.filename or "")[1].lower()
+        contents = await file.read()
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        file_data.append((contents, file.filename, ext, file.content_type))
 
-            if ext in PDF_EXTENSIONS or (file.content_type and "pdf" in file.content_type):
-                image_base64 = render_pdf_page_to_base64(contents, page_num=1)
-            else:
-                image = Image.open(io.BytesIO(contents))
-                image_base64 = image_to_base64(image)
+    tasks = [_process_file(c, fn, ext, ct) for c, fn, ext, ct in file_data]
+    results = await asyncio.gather(*tasks)
 
-            raw_output = await run_inference(image_base64)
-            parsed = parse_model_output(raw_output)
-
-            results.append({
-                "filename": file.filename,
-                "text": parsed["text"],
-                "metadata": parsed["metadata"],
-                "success": True,
-            })
-
-        except Exception as e:
-            logger.error(f"Error processing {file.filename}: {str(e)}")
-            results.append({
-                "filename": file.filename,
-                "text": "",
-                "success": False,
-                "error": str(e),
-            })
-
-    return {"results": results}
+    return {"results": list(results)}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    port = int(os.getenv("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)

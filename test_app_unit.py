@@ -13,7 +13,7 @@ from PIL import Image
 from fastapi.testclient import TestClient
 
 import app as app_module
-from app import app, get_ocr_prompt, parse_model_output, image_to_base64
+from app import app, get_ocr_prompt, parse_model_output, image_to_base64, process_pages_parallel
 
 
 # ---------------------------------------------------------------------------
@@ -37,27 +37,19 @@ MOCK_RAW_OUTPUT = (
     "Hello, world!"
 )
 
-MOCK_VLLM_RESPONSE = {
-    "id": "chatcmpl-test",
-    "object": "chat.completion",
-    "choices": [
-        {
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": MOCK_RAW_OUTPUT,
-            },
-            "finish_reason": "stop",
-        }
-    ],
-}
+
+# Mock check_vllm_ready for all tests that hit OCR endpoints (middleware check)
+_mock_vllm_ready = patch.object(
+    app_module, "check_vllm_ready", new_callable=AsyncMock, return_value=True
+)
 
 
 @pytest.fixture()
 def client():
     """TestClient with vLLM health check mocked as ready."""
-    with TestClient(app, raise_server_exceptions=False) as c:
-        yield c
+    with _mock_vllm_ready:
+        with TestClient(app, raise_server_exceptions=False) as c:
+            yield c
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +104,6 @@ class TestImageToBase64:
         img = Image.new("RGB", (10, 10), color="blue")
         b64 = image_to_base64(img)
         assert isinstance(b64, str)
-        # Should be valid base64 that decodes to a PNG
         decoded = base64.b64decode(b64)
         assert decoded[:4] == b"\x89PNG"
 
@@ -125,7 +116,6 @@ class TestImageToBase64:
     def test_large_image_resized(self):
         img = Image.new("RGB", (3000, 2000), color="green")
         b64 = image_to_base64(img, target_longest_dim=1288)
-        # Decode and check the resulting image dimensions
         result_img = Image.open(io.BytesIO(base64.b64decode(b64)))
         assert max(result_img.size) <= 1288
 
@@ -161,8 +151,9 @@ class TestHealthEndpoint:
         assert data["model_loaded"] is True
 
     @patch.object(app_module, "check_vllm_ready", new_callable=AsyncMock, return_value=False)
-    def test_unhealthy_when_vllm_not_ready(self, mock_ready, client):
-        resp = client.get("/health")
+    def test_unhealthy_when_vllm_not_ready(self, mock_ready):
+        with TestClient(app, raise_server_exceptions=False) as c:
+            resp = c.get("/health")
         assert resp.status_code == 503
         assert "not ready" in resp.json()["detail"]
 
@@ -300,3 +291,78 @@ class TestBatchEndpoint:
         data = resp.json()
         assert data["results"][0]["success"] is True
         assert data["results"][1]["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# 3. Parallel processing tests
+# ---------------------------------------------------------------------------
+
+class TestParallelPdfProcessing:
+    """Test that parallel page processing returns correct, ordered results."""
+
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
+    def test_parallel_pages_returns_ordered(self, mock_render, mock_inf, client):
+        """5 pages processed in parallel should return in page order."""
+        resp = client.post(
+            "/ocr/pdf?pages=1-5",
+            files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
+        )
+        data = resp.json()
+        assert data["total_pages"] == 5
+        assert len(data["results"]) == 5
+        pages = [r["page"] for r in data["results"]]
+        assert pages == [1, 2, 3, 4, 5]
+        assert all(r["success"] for r in data["results"])
+        assert all(r["text"] == "Hello, world!" for r in data["results"])
+
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
+    @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
+    def test_parallel_all_pages_get_inference(self, mock_render, mock_inf, client):
+        """Each page should trigger one render and one inference call."""
+        resp = client.post(
+            "/ocr/pdf?pages=1-3",
+            files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
+        )
+        assert resp.status_code == 200
+        assert mock_render.call_count == 3
+        assert mock_inf.call_count == 3
+
+    @patch.object(
+        app_module, "run_inference", new_callable=AsyncMock,
+        side_effect=[MOCK_RAW_OUTPUT, RuntimeError("page 2 failed"), MOCK_RAW_OUTPUT],
+    )
+    @patch.object(app_module, "render_pdf_page_to_base64", return_value="AAAA")
+    def test_parallel_partial_failure(self, mock_render, mock_inf, client):
+        """One page failing shouldn't affect other pages."""
+        resp = client.post(
+            "/ocr/pdf?pages=1-3",
+            files={"file": ("doc.pdf", b"%PDF-fake", "application/pdf")},
+        )
+        data = resp.json()
+        assert data["total_pages"] == 3
+        assert data["results"][0]["success"] is True
+        assert data["results"][1]["success"] is False
+        assert "page 2 failed" in data["results"][1]["error"]
+        assert data["results"][2]["success"] is True
+
+
+class TestParallelBatchProcessing:
+    """Test that batch endpoint processes files concurrently."""
+
+    @patch.object(app_module, "run_inference", new_callable=AsyncMock, return_value=MOCK_RAW_OUTPUT)
+    def test_batch_parallel_multiple_images(self, mock_inf, client):
+        """Multiple images should be processed concurrently."""
+        files = [
+            ("files", ("a.png", _make_png_bytes(color="red"), "image/png")),
+            ("files", ("b.png", _make_png_bytes(color="blue"), "image/png")),
+            ("files", ("c.png", _make_png_bytes(color="green"), "image/png")),
+        ]
+        resp = client.post("/ocr/batch", files=files)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert len(data["results"]) == 3
+        assert all(r["success"] for r in data["results"])
+        filenames = [r["filename"] for r in data["results"]]
+        assert filenames == ["a.png", "b.png", "c.png"]
+        assert mock_inf.call_count == 3
