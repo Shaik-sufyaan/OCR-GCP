@@ -66,7 +66,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EXPOSE 8080
 
 # Health check (longer start period for vLLM model loading)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=600s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Run the entrypoint script (starts vLLM then FastAPI)

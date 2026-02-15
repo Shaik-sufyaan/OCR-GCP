@@ -12,7 +12,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Default values
-REGION="us-central1"
+REGION="us-east4"
 SERVICE_NAME="olmocr-api"
 MEMORY="32Gi"
 CPU="8"
