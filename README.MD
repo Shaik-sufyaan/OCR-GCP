@@ -1,284 +1,204 @@
-# OlmOCR Deployment on GCP
+# OlmOCR API
 
-OCR API powered by [allenai/olmOCR-2-7B-1025-FP8](https://huggingface.co/allenai/olmOCR-2-7B-1025-FP8) model, deployed on Google Cloud Platform.
+OCR API powered by [allenai/olmOCR-2-7B-1025-FP8](https://huggingface.co/allenai/olmOCR-2-7B-1025-FP8), deployed on GCP Cloud Run with an NVIDIA L4 GPU.
 
-## 📋 Prerequisites
+**Base URL:** `https://olmocr-api-5ejysn2nla-uk.a.run.app`
 
-- Google Cloud Platform account
-- `gcloud` CLI installed and configured
-- Docker installed (for local testing)
-- Git
-
-## 🏗️ Project Structure
-
-```
-olmocr-deployment/
-├── app.py                 # FastAPI application
-├── requirements.txt       # Python dependencies
-├── Dockerfile            # Container configuration
-├── .dockerignore         # Docker build exclusions
-├── .gitignore           # Git exclusions
-├── cloudbuild.yaml      # GCP Cloud Build configuration
-├── app.yaml             # App Engine configuration (optional)
-└── README.md            # This file
-```
-
-## 🚀 Deployment Options
-
-### Option 1: Cloud Run (Recommended)
-
-Cloud Run is serverless, scales to zero, and is cost-effective for variable workloads.
-
-#### Step 1: Set up GCP Project
-
-```bash
-# Set your project ID
-export PROJECT_ID="your-project-id"
-export REGION="us-central1"
-export SERVICE_NAME="olmocr-api"
-
-# Set the project
-gcloud config set project $PROJECT_ID
-
-# Enable required APIs
-gcloud services enable cloudbuild.googleapis.com
-gcloud services enable run.googleapis.com
-gcloud services enable containerregistry.googleapis.com
-```
-
-#### Step 2: Build and Deploy
-
-```bash
-# Build the container
-gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE_NAME
-
-# Deploy to Cloud Run
-gcloud run deploy $SERVICE_NAME \
-  --image gcr.io/$PROJECT_ID/$SERVICE_NAME \
-  --platform managed \
-  --region $REGION \
-  --memory 8Gi \
-  --cpu 2 \
-  --timeout 300 \
-  --max-instances 10 \
-  --allow-unauthenticated
-```
-
-#### Step 3: Get Service URL
-
-```bash
-gcloud run services describe $SERVICE_NAME --region $REGION --format 'value(status.url)'
-```
-
-### Option 2: Google Kubernetes Engine (GKE)
-
-For production workloads requiring more control.
-
-#### Step 1: Create GKE Cluster
-
-```bash
-gcloud container clusters create olmocr-cluster \
-  --region $REGION \
-  --machine-type n1-standard-4 \
-  --num-nodes 2 \
-  --enable-autoscaling \
-  --min-nodes 1 \
-  --max-nodes 5
-```
-
-#### Step 2: Build and Push Image
-
-```bash
-gcloud builds submit --tag gcr.io/$PROJECT_ID/$SERVICE_NAME
-```
-
-#### Step 3: Deploy to GKE
-
-```bash
-# Get cluster credentials
-gcloud container clusters get-credentials olmocr-cluster --region $REGION
-
-# Deploy
-kubectl create deployment olmocr --image=gcr.io/$PROJECT_ID/$SERVICE_NAME
-
-# Expose service
-kubectl expose deployment olmocr --type LoadBalancer --port 80 --target-port 8080
-```
-
-### Option 3: Compute Engine (VM-based)
-
-For persistent instances with full control.
-
-#### Step 1: Create VM Instance
-
-```bash
-gcloud compute instances create olmocr-vm \
-  --zone us-central1-a \
-  --machine-type n1-standard-4 \
-  --boot-disk-size 50GB \
-  --image-family debian-11 \
-  --image-project debian-cloud \
-  --tags http-server,https-server
-```
-
-#### Step 2: SSH and Setup
-
-```bash
-# SSH into instance
-gcloud compute ssh olmocr-vm --zone us-central1-a
-
-# Install Docker
-sudo apt-get update
-sudo apt-get install -y docker.io git
-sudo usermod -aG docker $USER
-
-# Clone repo and build
-git clone <your-repo-url>
-cd olmocr-deployment
-sudo docker build -t olmocr .
-sudo docker run -d -p 80:8080 olmocr
-```
-
-## 🧪 Local Testing
-
-```bash
-# Build Docker image
-docker build -t olmocr .
-
-# Run container
-docker run -p 8080:8080 olmocr
-
-# Test the API
-curl http://localhost:8080/health
-```
-
-## 📝 API Usage
+## Endpoints
 
 ### Health Check
 
-```bash
-curl https://your-service-url.run.app/health
+```
+GET /health
 ```
 
-### Single Image OCR
-
 ```bash
-curl -X POST https://your-service-url.run.app/ocr \
-  -F "file=@/path/to/image.jpg"
+curl https://olmocr-api-5ejysn2nla-uk.a.run.app/health
 ```
 
-### Batch OCR
+**Response:**
+```json
+{
+  "status": "healthy",
+  "model_loaded": true,
+  "backend": "vllm"
+}
+```
+
+---
+
+### OCR - Single Image or PDF (first page)
+
+```
+POST /ocr
+```
+
+Upload a single image (JPEG, PNG, BMP, TIFF, WebP) or PDF (processes first page only).
 
 ```bash
-curl -X POST https://your-service-url.run.app/ocr/batch \
+curl -X POST https://olmocr-api-5ejysn2nla-uk.a.run.app/ocr \
+  -F "file=@image.jpg"
+```
+
+**Response:**
+```json
+{
+  "text": "Extracted text content...",
+  "metadata": {
+    "primary_language": "English",
+    "is_table": "False",
+    "is_diagram": "False"
+  },
+  "success": true,
+  "message": "OCR completed successfully"
+}
+```
+
+---
+
+### OCR - Multi-Page PDF
+
+```
+POST /ocr/pdf?pages={page_spec}
+```
+
+Process specific pages from a PDF. Pages are processed in parallel for speed.
+
+| Parameter | Type   | Default | Description                                      |
+|-----------|--------|---------|--------------------------------------------------|
+| `file`    | file   | required| PDF file upload                                  |
+| `pages`   | string | `"1"`   | Page spec: `"1"`, `"1-5"`, `"1,3,5"`, or `"1-3,7"` |
+
+```bash
+# Single page
+curl -X POST "https://olmocr-api-5ejysn2nla-uk.a.run.app/ocr/pdf?pages=1" \
+  -F "file=@document.pdf"
+
+# Page range
+curl -X POST "https://olmocr-api-5ejysn2nla-uk.a.run.app/ocr/pdf?pages=1-5" \
+  -F "file=@document.pdf"
+
+# Specific pages
+curl -X POST "https://olmocr-api-5ejysn2nla-uk.a.run.app/ocr/pdf?pages=1,3,7" \
+  -F "file=@document.pdf"
+```
+
+**Response:**
+```json
+{
+  "total_pages": 5,
+  "results": [
+    {
+      "page": 1,
+      "text": "Page 1 text...",
+      "metadata": { "primary_language": "English" },
+      "success": true
+    },
+    {
+      "page": 2,
+      "text": "Page 2 text...",
+      "metadata": { "primary_language": "English" },
+      "success": true
+    }
+  ]
+}
+```
+
+---
+
+### OCR - Batch (Multiple Files)
+
+```
+POST /ocr/batch
+```
+
+Upload multiple images/PDFs at once. PDFs are processed first page only.
+
+```bash
+curl -X POST https://olmocr-api-5ejysn2nla-uk.a.run.app/ocr/batch \
   -F "files=@image1.jpg" \
-  -F "files=@image2.jpg"
+  -F "files=@image2.png" \
+  -F "files=@doc.pdf"
 ```
 
-### Python Example
+**Response:**
+```json
+{
+  "results": [
+    { "filename": "image1.jpg", "text": "...", "metadata": {}, "success": true },
+    { "filename": "image2.png", "text": "...", "metadata": {}, "success": true },
+    { "filename": "doc.pdf", "text": "...", "metadata": {}, "success": true }
+  ]
+}
+```
+
+---
+
+## Python Integration
 
 ```python
 import requests
 
-url = "https://your-service-url.run.app/ocr"
-files = {"file": open("image.jpg", "rb")}
-response = requests.post(url, files=files)
-print(response.json())
+API_URL = "https://olmocr-api-5ejysn2nla-uk.a.run.app"
+
+# Single image/PDF (first page)
+with open("document.pdf", "rb") as f:
+    resp = requests.post(f"{API_URL}/ocr", files={"file": f})
+    print(resp.json()["text"])
+
+# Multi-page PDF
+with open("document.pdf", "rb") as f:
+    resp = requests.post(f"{API_URL}/ocr/pdf?pages=1-5", files={"file": f})
+    for page in resp.json()["results"]:
+        print(f"Page {page['page']}: {page['text']}")
 ```
 
-## 💰 Cost Optimization
+## JavaScript/Node.js Integration
 
-### Cloud Run
-- **Scales to zero**: No charges when idle
-- **Pay per request**: Only charged for actual usage
-- **Memory**: 8GB recommended for model loading
-- **Estimated cost**: ~$0.10-0.50 per hour of active use
+```javascript
+// Using fetch + FormData
+const form = new FormData();
+form.append("file", fileBlob, "document.pdf");
 
-### Tips
-1. Use Cloud Run for variable workloads
-2. Set max instances to control costs
-3. Monitor usage with Cloud Monitoring
-4. Consider reserved instances for consistent loads
-
-## 🔧 Configuration
-
-### Environment Variables
-
-You can customize the deployment with these environment variables:
-
-```bash
-# In Dockerfile or deployment config
-ENV MODEL_NAME="allenai/olmOCR-2-7B-1025-FP8"
-ENV MAX_NEW_TOKENS=512
-ENV PORT=8080
+const resp = await fetch("https://olmocr-api-5ejysn2nla-uk.a.run.app/ocr/pdf?pages=1-5", {
+  method: "POST",
+  body: form,
+});
+const data = await resp.json();
+data.results.forEach((page) => {
+  console.log(`Page ${page.page}: ${page.text}`);
+});
 ```
 
-### Scaling
+## Limits
 
-For Cloud Run:
-```bash
-gcloud run services update $SERVICE_NAME \
-  --min-instances 1 \
-  --max-instances 20 \
-  --concurrency 10
+| Limit              | Value   |
+|---------------------|---------|
+| Max file size        | 50 MB   |
+| Max concurrent pages | 4       |
+| Request timeout      | 300s    |
+| Supported images     | JPEG, PNG, BMP, TIFF, WebP |
+| Supported documents  | PDF     |
+
+## Error Responses
+
+| Status | Meaning                          |
+|--------|----------------------------------|
+| 400    | Unsupported file type or file too large |
+| 500    | OCR processing failed            |
+| 503    | Model not ready (cold start ~60s) |
+
+Errors return:
+```json
+{
+  "text": "",
+  "success": false,
+  "message": "Error description"
+}
 ```
 
-## 📊 Monitoring
+## Notes
 
-```bash
-# View logs
-gcloud run services logs read $SERVICE_NAME --region $REGION
-
-# Monitor metrics
-gcloud monitoring dashboards list
-```
-
-## 🐛 Troubleshooting
-
-### Model loading timeout
-- Increase `--timeout` in Cloud Run deployment
-- Use larger instance size
-
-### Out of memory
-- Increase `--memory` to 16Gi or 32Gi
-- Reduce batch size
-
-### Slow response
-- Add `--min-instances 1` to keep instance warm
-- Use GPU-enabled instances for GKE/GCE
-
-## 🔐 Security
-
-### Enable Authentication
-
-```bash
-# Require authentication
-gcloud run services update $SERVICE_NAME \
-  --no-allow-unauthenticated \
-  --region $REGION
-```
-
-### API Key Protection
-
-Add API key middleware to `app.py`:
-
-```python
-from fastapi import Header, HTTPException
-
-@app.middleware("http")
-async def verify_api_key(request: Request, call_next):
-    api_key = request.headers.get("X-API-Key")
-    if api_key != os.getenv("API_KEY"):
-        raise HTTPException(status_code=401, detail="Invalid API Key")
-    return await call_next(request)
-```
-
-## 📚 Resources
-
-- [OlmOCR Model Card](https://huggingface.co/allenai/olmOCR-2-7B-1025-FP8)
-- [Cloud Run Documentation](https://cloud.google.com/run/docs)
-- [GCP Pricing Calculator](https://cloud.google.com/products/calculator)
-
-## 📄 License
-
-Follow the license terms of the OlmOCR model and your GCP usage agreement.
+- First request after idle may take ~60s (cold start: container + model loading).
+- The API uses CORS `*` so it can be called from any frontend.
+- Interactive docs available at `/docs` (Swagger UI).
